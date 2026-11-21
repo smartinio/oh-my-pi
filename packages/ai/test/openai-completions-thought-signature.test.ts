@@ -24,6 +24,7 @@ const userMessage: Message = {
 
 type SignatureShape =
 	| { type: "tool"; namespace: "google" | "vertex" }
+	| { type: "function" }
 	| { type: "message"; field: "thinking_signature" | "thought_signature" | "reasoning_signature" };
 
 function sseResponse(delta: Record<string, unknown>, finishReason: "stop" | "tool_calls"): Response {
@@ -52,17 +53,20 @@ function createFetch(signature: SignatureShape, payloads: unknown[]): FetchImpl 
 	async function mockFetch(_input: string | URL | Request, init?: RequestInit): Promise<Response> {
 		if (typeof init?.body === "string") payloads.push(JSON.parse(init.body));
 		if (requestIndex++ === 0) {
+			const toolCallFunction: Record<string, unknown> = { name: "read", arguments: '{"path":"README.md"}' };
 			const toolCall: Record<string, unknown> = {
 				index: 0,
 				id: "call_1",
 				type: "function",
-				function: { name: "read", arguments: '{"path":"README.md"}' },
+				function: toolCallFunction,
 			};
 			const delta: Record<string, unknown> = { role: "assistant", tool_calls: [toolCall] };
 			if (signature.type === "tool") {
 				toolCall.extra_content = {
 					[signature.namespace]: { thought_signature: "opaque-signature" },
 				};
+			} else if (signature.type === "function") {
+				toolCallFunction.thought_signature = "opaque-signature";
 			} else {
 				delta[signature.field] = "opaque-signature";
 			}
@@ -128,6 +132,13 @@ async function expectThoughtSignatureRoundTrip(signature: SignatureShape): Promi
 				},
 			],
 		});
+	} else if (signature.type === "function") {
+		expect(replayedAssistant).toMatchObject({
+			role: "assistant",
+			tool_calls: [{ id: "call_1", function: { thought_signature: "opaque-signature" } }],
+		});
+		expect(replayedAssistant).not.toHaveProperty("reasoning_details");
+		expect(replayedAssistant).not.toHaveProperty(["tool_calls", 0, "extra_content"]);
 	} else {
 		expect(Reflect.get(replayedAssistant, signature.field)).toBe("opaque-signature");
 		if (signature.field === "reasoning_signature") {
@@ -144,6 +155,10 @@ describe("OpenAI-compatible Gemini thought signatures", () => {
 
 	it("round-trips the vertex signature namespace", async () => {
 		await expectThoughtSignatureRoundTrip({ type: "tool", namespace: "vertex" });
+	});
+
+	it("round-trips a function-level thought_signature", async () => {
+		await expectThoughtSignatureRoundTrip({ type: "function" });
 	});
 
 	it("round-trips a message-level thinking_signature", async () => {

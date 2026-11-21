@@ -178,7 +178,12 @@ type GeminiThoughtSignatureExtraContent = Partial<
 	Record<GeminiThoughtSignatureNamespace, { thought_signature: string }>
 >;
 
-type OpenAICompletionsFunctionToolCall = ChatCompletionMessageFunctionToolCall & {
+// When strict OpenAI compliance is off, Portkey sends the per-call Gemini signature
+// on the `function` object of the tool call instead of in `extra_content`.
+type GeminiFunctionThoughtSignature = { function: { thought_signature: string } };
+
+type OpenAICompletionsFunctionToolCall = Omit<ChatCompletionMessageFunctionToolCall, "function"> & {
+	function: ChatCompletionMessageFunctionToolCall["function"] & { thought_signature?: string };
 	extra_content?: GeminiThoughtSignatureExtraContent;
 };
 
@@ -202,6 +207,15 @@ function getGeminiThoughtSignatureExtraContent(value: unknown): GeminiThoughtSig
 			: { vertex: { thought_signature: thoughtSignature } };
 	}
 	return undefined;
+}
+
+function getGeminiFunctionThoughtSignature(value: unknown): GeminiFunctionThoughtSignature | undefined {
+	if (typeof value !== "object" || value === null) return undefined;
+	const toolCallFunction = Reflect.get(value, "function");
+	if (typeof toolCallFunction !== "object" || toolCallFunction === null) return undefined;
+	const thoughtSignature = Reflect.get(toolCallFunction, "thought_signature");
+	if (typeof thoughtSignature !== "string" || thoughtSignature.length === 0) return undefined;
+	return { function: { thought_signature: thoughtSignature } };
 }
 
 function getGeminiMessageThoughtSignature(value: unknown): GeminiMessageThoughtSignature | undefined {
@@ -261,12 +275,12 @@ function accumulateReasoningDetail(details: ReasoningDetail[], detail: Reasoning
 }
 
 // A single tool-call turn on an OpenAI-compatible Gemini wire can carry two
-// independent signatures: a per-call one (`extra_content.google|vertex` or an
-// encrypted `reasoning_details` entry) and a message-level signature
+// independent signatures: a per-call one (`extra_content.google|vertex`,
+// `function.thought_signature`, or an encrypted `reasoning_details` entry) and a message-level signature
 // (`thinking_signature`, `thought_signature`, or `reasoning_signature`).
 // Both are stashed together on the originating tool call's `thoughtSignature`
 // so persistence and replay preserve each field.
-// `perCall` holds the raw extra_content object or reasoning detail; `message`
+// `perCall` holds the raw extra_content object, function signature, or reasoning detail; `message`
 // holds the message-level signature in its wire shape.
 type StoredGeminiSignature = {
 	perCall?: unknown;
@@ -1754,6 +1768,12 @@ const streamOpenAICompletionsOnce = (
 									perCall: extraContent,
 								});
 							}
+							const functionSignature = getGeminiFunctionThoughtSignature(toolCall);
+							if (functionSignature) {
+								block.thoughtSignature = mergeStoredGeminiSignature(block.thoughtSignature, {
+									perCall: functionSignature,
+								});
+							}
 							let delta = "";
 							// The OpenAI SDK types `function.arguments` as a JSON string, but MiniMax-compatible
 							// hosts stream a fully-formed object instead. Model both shapes so the branches below
@@ -2901,6 +2921,10 @@ export function convertMessages(
 					const stored = normalizeStoredGeminiSignature(parseStoredThoughtSignature(tc.thoughtSignature));
 					const extraContent = getGeminiThoughtSignatureExtraContent(stored?.perCall);
 					if (extraContent) replayedToolCall.extra_content = extraContent;
+					const functionSignature = getGeminiFunctionThoughtSignature(stored?.perCall);
+					if (functionSignature) {
+						replayedToolCall.function.thought_signature = functionSignature.function.thought_signature;
+					}
 					return replayedToolCall;
 				});
 				for (const toolCall of toolCalls) {
@@ -2926,7 +2950,13 @@ export function convertMessages(
 					: toolCalls.flatMap(tc => {
 							const stored = normalizeStoredGeminiSignature(parseStoredThoughtSignature(tc.thoughtSignature));
 							const perCall = stored?.perCall;
-							if (perCall === undefined || getGeminiThoughtSignatureExtraContent(perCall)) return [];
+							if (
+								perCall === undefined ||
+								getGeminiThoughtSignatureExtraContent(perCall) ||
+								getGeminiFunctionThoughtSignature(perCall)
+							) {
+								return [];
+							}
 							return [perCall];
 						});
 			if (reasoningDetails.length > 0) {
